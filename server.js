@@ -8,12 +8,12 @@ const fs = require('fs');
 const path = require('path');
 const app = express();
 
-console.log("=== [MAGAZZINO] MOTORE API V2 (PIANO B) ATTIVATO ===");
+console.log("=== [MAGAZZINO] MOTORE IBRIDO (PIANO B + PIANO A) ATTIVATO ===");
 
 const processingQueue = [];
 let isProcessing = false;
 
-app.get('/', (req, res) => res.send('🏭 Magazzino Proxy Operativo (Motore V2)'));
+app.get('/', (req, res) => res.send('🏭 Magazzino Proxy Operativo (Motore Ibrido)'));
 
 app.get('/api/process', async (req, res) => {
     const query = req.query.q;
@@ -35,6 +35,76 @@ app.get('/api/process', async (req, res) => {
     }
 });
 
+// ==========================================
+// FUNZIONE: TENTA PIANO B (Veloce, 500/giorno)
+// ==========================================
+async function tentaPianoB(video, apiKey) {
+    console.log(`[⚡ PIANO B] Avvio richiesta API V2 (Primaria)...`);
+    const host = "youtube-info-download-api.p.rapidapi.com";
+    const headers = { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': host, 'Content-Type': 'application/json' };
+    
+    const ytFullUrl = `https://www.youtube.com/watch?v=${video.videoId}`;
+    const startUrl = `https://${host}/ajax/download.php?format=mp3&audio_quality=128&add_info=0&url=${encodeURIComponent(ytFullUrl)}`;
+    
+    const startRes = await fetch(startUrl, { headers });
+    const startData = await startRes.json();
+
+    if (!startData.success) throw new Error(startData.message || "Rifiutato dall'API.");
+
+    let directUrl = startData.downloadUrl || startData.url || startData.link || startData.download_url;
+    
+    if (!directUrl && startData.progress_url) {
+        for (let i = 0; i < 40; i++) {
+            await new Promise(r => setTimeout(r, 3000));
+            const progRes = await fetch(startData.progress_url);
+            if (progRes.ok) {
+               const progData = await progRes.json();
+               directUrl = progData.downloadUrl || progData.url || progData.link || progData.download_url;
+               if (directUrl) break;
+            }
+        }
+    }
+
+    if (!directUrl) throw new Error("Timeout Piano B.");
+    return directUrl;
+}
+
+// ==========================================
+// FUNZIONE: TENTA PIANO A (Lento, Limite Alto)
+// ==========================================
+async function tentaPianoA(video, apiKey) {
+    console.log(`[🐢 PIANO A] Avvio richiesta API V1 (Emergenza)...`);
+    const host = "youtube-mp4-mp3-downloader.p.rapidapi.com";
+    const headers = { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': host };
+    
+    const startUrl = `https://${host}/api/v1/download?id=${video.videoId}&format=mp3&audioQuality=128`;
+    const startRes = await fetch(startUrl, { headers });
+    const startData = await startRes.json();
+
+    let directUrl = startData.downloadUrl || startData.url || startData.link;
+    
+    if (!directUrl) {
+        const ticket = startData.progressId;
+        if (!ticket) throw new Error("Nessun ticket ricevuto.");
+
+        for (let i = 0; i < 50; i++) {
+            await new Promise(r => setTimeout(r, 4000));
+            const progRes = await fetch(`https://${host}/api/v1/progress?id=${ticket}`, { headers });
+            if (progRes.ok) {
+               const progData = await progRes.json();
+               directUrl = progData.downloadUrl || progData.url || progData.link;
+               if (directUrl) break;
+            }
+        }
+    }
+
+    if (!directUrl) throw new Error("Timeout estremo Piano A.");
+    return directUrl;
+}
+
+// ==========================================
+// IL MOTORE PRINCIPALE
+// ==========================================
 async function processNextInQueue() {
     if (processingQueue.length === 0) {
         isProcessing = false;
@@ -49,132 +119,84 @@ async function processNextInQueue() {
     try {
         console.log(`\n[⚙️ ELABORO] Task: "${task.query}"`);
 
-        // STEP 1: RICERCA SU YOUTUBE
+        // STEP 1: Ricerca
         let searchQuery = task.query;
-        console.log(`[🔎 STEP 1] Cerco su YouTube: ${searchQuery}`);
         const searchResult = await ytSearch(searchQuery);
         const video = searchResult.videos[0];
         
-        if (!video) throw new Error("Video non trovato.");
+        if (!video) throw new Error("Video non trovato su YouTube.");
         console.log(`[🎯 STEP 1 OK] Trovato: "${video.title}"`);
 
-        // ==========================================
-        // STEP 2: NUOVO MOTORE API (PIANO B)
-        // ==========================================
-        const host = "youtube-info-download-api.p.rapidapi.com";
-        const headers = { 
-            'x-rapidapi-key': apiKey, 
-            'x-rapidapi-host': host,
-            'Content-Type': 'application/json'
-        };
-        
-        // La nuova API vuole il link completo di YouTube
-        const ytFullUrl = `https://www.youtube.com/watch?v=${video.videoId}`;
-        
-        console.log(`[📡 STEP 2] Richiedo conversione (API V2)...`);
-        const startUrl = `https://${host}/ajax/download.php?format=mp3&audio_quality=128&add_info=0&url=${encodeURIComponent(ytFullUrl)}`;
-        
-        const startRes = await fetch(startUrl, { headers });
-        const startData = await startRes.json();
-
-        if (!startData.success && startData.message) {
-            throw new Error(`L'API ha rifiutato la richiesta: ${startData.message}`);
+        // STEP 2: MOTORE IBRIDO (La vera Magia)
+        let directUrl = null;
+        try {
+            // Proviamo sempre e prima il Piano B
+            directUrl = await tentaPianoB(video, apiKey);
+            console.log(`[✅ PIANO B OK] Link MP3 ottenuto velocemente.`);
+        } catch (erroreB) {
+            // Se finisci le 500 chiamate o il server cade, entra qui!
+            console.log(`[⚠️ PIANO B FALLITO] Motivo: ${erroreB.message}`);
+            console.log(`[🔄 FAILOVER] Passo automaticamente al Piano A...`);
+            
+            // Ritentiamo col Piano A
+            directUrl = await tentaPianoA(video, apiKey);
+            console.log(`[✅ PIANO A OK] Link MP3 di emergenza ottenuto.`);
         }
 
-        // Cerchiamo se ci dà subito il link o se dobbiamo fare polling
-        let directUrl = startData.downloadUrl || startData.url || startData.link || startData.download_url;
-        
-        if (!directUrl && startData.progress_url) {
-            console.log(`[🎫 STEP 2] Uso il progress_url nativo. Polling...`);
-
-            for (let i = 0; i < 50; i++) {
-                await new Promise(r => setTimeout(r, 4000));
-                
-                // La nuova API ci fornisce un link esterno (es. p.savenow.to), lo chiamiamo direttamente!
-                const progRes = await fetch(startData.progress_url);
-                if (progRes.ok) {
-                   const progData = await progRes.json();
-                   
-                   // Controlliamo tutte le possibili chiavi in cui il sito potrebbe nascondere l'MP3 finale
-                   directUrl = progData.downloadUrl || progData.url || progData.link || progData.download_url;
-                   if (directUrl) break;
-                }
-            }
-        }
-
-        if (!directUrl) throw new Error("Timeout estremo API conversione (V2).");
-        console.log(`[✅ STEP 2 OK] Link ottenuto. Inizio download su disco...`);
-
-        // ==========================================
-        // STEP 3: DOWNLOAD COMPLETO SU DISCO
-        // ==========================================
+        // STEP 3: Download su disco (Proxy)
         const streamId = Math.random().toString(36).substring(7);
         const fileName = `${streamId}.mp3`;
         const filePath = path.join(__dirname, fileName);
 
+        console.log(`[💾 STEP 3] Scarico il file in RAM/Disco...`);
         const audioResponse = await fetch(directUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-        if (!audioResponse.ok) throw new Error("Il server origine ha rifiutato il download.");
+        if (!audioResponse.ok) throw new Error("Rifiutato dal server origine.");
 
         const webStream = Readable.fromWeb(audioResponse.body);
         await pipeline(webStream, fs.createWriteStream(filePath));
         
-        console.log(`[💾 STEP 3 OK] File MP3 salvato fisicamente: ${fileName}`);
+        console.log(`[✅ COMPLETATO] Proxy pronto: ${fileName}`);
 
         setTimeout(() => {
             if (fs.existsSync(filePath)) {
                 fs.unlinkSync(filePath);
-                console.log(`[🗑️ PULIZIA] File ${fileName} eliminato.`);
             }
         }, 2 * 60 * 60 * 1000);
 
         const proxyUrl = `https://${process.env.RENDER_EXTERNAL_HOSTNAME}/api/stream/${streamId}`;
 
-        task.resolve({ 
-            success: true, 
-            title: video.title, 
-            videoId: video.videoId, 
-            url: proxyUrl 
-        });
+        task.resolve({ success: true, title: video.title, videoId: video.videoId, url: proxyUrl });
 
     } catch (e) {
-        console.error(`[❌ ERRORE TASK]`, e.message);
+        console.error(`[❌ ERRORE CRITICO TASK]`, e.message);
         task.reject(e);
     } finally {
         processNextInQueue(); 
     }
 }
 
+// Endpoint del proxy statico
 app.get('/api/stream/:id', (req, res) => {
     const filePath = path.join(__dirname, req.params.id + ".mp3");
-    if (!fs.existsSync(filePath)) {
-        return res.status(404).send("File scaduto o inesistente.");
-    }
-    
+    if (!fs.existsSync(filePath)) return res.status(404).send("File inesistente.");
     res.setHeader('Content-Type', 'audio/mpeg');
     res.sendFile(filePath);
 });
 
+// Endpoint Spotify
 app.get('/api/spotify', async (req, res) => {
     const url = req.query.url;
     try {
-        console.log(`[🟢 SPOTIFY] Estraggo metadati...`);
         const data = await spotify.getTracks(url);
-        if (!data || data.length === 0) throw new Error("Playlist vuota o privata.");
+        if (!data || data.length === 0) throw new Error("Playlist privata.");
         
         const trackNames = data.map(track => {
-            let artistStr = "";
-            if (track.artists && track.artists.length > 0) {
-                artistStr = track.artists.map(a => a.name).join(' ');
-            } else if (track.subtitle) {
-                artistStr = track.subtitle;
-            }
+            let artistStr = track.artists && track.artists.length > 0 ? track.artists.map(a => a.name).join(' ') : (track.subtitle || "");
             return `${artistStr} ${track.name}`.trim();
         });
-        
         res.json({ success: true, tracks: trackNames });
     } catch (e) {
-        console.error(`[❌ ERRORE SPOTIFY]`, e.message);
-        res.status(500).json({ error: "Impossibile leggere il link Spotify." });
+        res.status(500).json({ error: "Errore Spotify." });
     }
 });
 
