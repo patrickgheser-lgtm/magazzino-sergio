@@ -8,12 +8,12 @@ const fs = require('fs');
 const path = require('path');
 const app = express();
 
-console.log("=== [MAGAZZINO] SISTEMA HARD-DISK & ANTI-TIMEOUT ATTIVATO ===");
+console.log("=== [MAGAZZINO] MOTORE API V2 (PIANO B) ATTIVATO ===");
 
 const processingQueue = [];
 let isProcessing = false;
 
-app.get('/', (req, res) => res.send('🏭 Magazzino Proxy Operativo'));
+app.get('/', (req, res) => res.send('🏭 Magazzino Proxy Operativo (Motore V2)'));
 
 app.get('/api/process', async (req, res) => {
     const query = req.query.q;
@@ -49,6 +49,7 @@ async function processNextInQueue() {
     try {
         console.log(`\n[⚙️ ELABORO] Task: "${task.query}"`);
 
+        // STEP 1: RICERCA SU YOUTUBE
         let searchQuery = task.query;
         console.log(`[🔎 STEP 1] Cerco su YouTube: ${searchQuery}`);
         const searchResult = await ytSearch(searchQuery);
@@ -57,36 +58,56 @@ async function processNextInQueue() {
         if (!video) throw new Error("Video non trovato.");
         console.log(`[🎯 STEP 1 OK] Trovato: "${video.title}"`);
 
-        const host = "youtube-mp4-mp3-downloader.p.rapidapi.com";
-        const headers = { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': host };
+        // ==========================================
+        // STEP 2: NUOVO MOTORE API (PIANO B)
+        // ==========================================
+        const host = "youtube-info-download-api.p.rapidapi.com";
+        const headers = { 
+            'x-rapidapi-key': apiKey, 
+            'x-rapidapi-host': host,
+            'Content-Type': 'application/json'
+        };
         
-        console.log(`[📡 STEP 2] Richiedo conversione...`);
-        const startUrl = `https://${host}/api/v1/download?id=${video.videoId}&format=mp3&audioQuality=128`;
+        // La nuova API vuole il link completo di YouTube
+        const ytFullUrl = `https://www.youtube.com/watch?v=${video.videoId}`;
+        
+        console.log(`[📡 STEP 2] Richiedo conversione (API V2)...`);
+        const startUrl = `https://${host}/ajax/download.php?format=mp3&audio_quality=128&add_info=0&url=${encodeURIComponent(ytFullUrl)}`;
+        
         const startRes = await fetch(startUrl, { headers });
         const startData = await startRes.json();
 
-        let directUrl = startData.downloadUrl || startData.url || startData.link;
-        
-        if (!directUrl) {
-            const ticket = startData.progressId;
-            console.log(`[🎫 STEP 2] Ticket: ${ticket}. Polling aumentato a 4 min...`);
+        if (!startData.success && startData.message) {
+            throw new Error(`L'API ha rifiutato la richiesta: ${startData.message}`);
+        }
 
-            // AUMENTATO A 50 TENTATIVI (Circa 3.5 minuti) per non fallire mai
+        // Cerchiamo se ci dà subito il link o se dobbiamo fare polling
+        let directUrl = startData.downloadUrl || startData.url || startData.link || startData.download_url;
+        
+        if (!directUrl && startData.progress_url) {
+            console.log(`[🎫 STEP 2] Uso il progress_url nativo. Polling...`);
+
             for (let i = 0; i < 50; i++) {
                 await new Promise(r => setTimeout(r, 4000));
-                const progRes = await fetch(`https://${host}/api/v1/progress?id=${ticket}`, { headers });
+                
+                // La nuova API ci fornisce un link esterno (es. p.savenow.to), lo chiamiamo direttamente!
+                const progRes = await fetch(startData.progress_url);
                 if (progRes.ok) {
                    const progData = await progRes.json();
-                   directUrl = progData.downloadUrl || progData.url || progData.link;
+                   
+                   // Controlliamo tutte le possibili chiavi in cui il sito potrebbe nascondere l'MP3 finale
+                   directUrl = progData.downloadUrl || progData.url || progData.link || progData.download_url;
                    if (directUrl) break;
                 }
             }
         }
 
-        if (!directUrl) throw new Error("Timeout estremo API conversione.");
+        if (!directUrl) throw new Error("Timeout estremo API conversione (V2).");
         console.log(`[✅ STEP 2 OK] Link ottenuto. Inizio download su disco...`);
 
-        // STEP 3: DOWNLOAD COMPLETO SU DISCO (Addio Lag)
+        // ==========================================
+        // STEP 3: DOWNLOAD COMPLETO SU DISCO
+        // ==========================================
         const streamId = Math.random().toString(36).substring(7);
         const fileName = `${streamId}.mp3`;
         const filePath = path.join(__dirname, fileName);
@@ -94,13 +115,11 @@ async function processNextInQueue() {
         const audioResponse = await fetch(directUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
         if (!audioResponse.ok) throw new Error("Il server origine ha rifiutato il download.");
 
-        // Salviamo l'intero MP3 fisicamente nel server Render
         const webStream = Readable.fromWeb(audioResponse.body);
         await pipeline(webStream, fs.createWriteStream(filePath));
         
         console.log(`[💾 STEP 3 OK] File MP3 salvato fisicamente: ${fileName}`);
 
-        // Eliminiamo il file dopo 2 ore per non riempire la memoria
         setTimeout(() => {
             if (fs.existsSync(filePath)) {
                 fs.unlinkSync(filePath);
@@ -125,27 +144,23 @@ async function processNextInQueue() {
     }
 }
 
-// L'endpoint che serve il file direttamente dal Disco Rigido
 app.get('/api/stream/:id', (req, res) => {
     const filePath = path.join(__dirname, req.params.id + ".mp3");
     if (!fs.existsSync(filePath)) {
         return res.status(404).send("File scaduto o inesistente.");
     }
     
-    // Serve il file MP3 statico ad altissima velocità
     res.setHeader('Content-Type', 'audio/mpeg');
     res.sendFile(filePath);
 });
 
-// Fixato il rilevamento nomi per Spotify
 app.get('/api/spotify', async (req, res) => {
     const url = req.query.url;
     try {
-        console.log(`[🟢 SPOTIFY] Estraggo metadati avanzati...`);
+        console.log(`[🟢 SPOTIFY] Estraggo metadati...`);
         const data = await spotify.getTracks(url);
         if (!data || data.length === 0) throw new Error("Playlist vuota o privata.");
         
-        // Estrazione nome artista sicura al 100%
         const trackNames = data.map(track => {
             let artistStr = "";
             if (track.artists && track.artists.length > 0) {
