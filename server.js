@@ -3,25 +3,24 @@ const express = require('express');
 const ytSearch = require('yt-search');
 const spotify = require('spotify-url-info')(fetch);
 const { Readable } = require('stream');
+const { pipeline } = require('stream/promises');
+const fs = require('fs');
+const path = require('path');
 const app = express();
 
-console.log("=== [MAGAZZINO] SISTEMA PROXY E CODE ATTIVATO ===");
+console.log("=== [MAGAZZINO] SISTEMA HARD-DISK & ANTI-TIMEOUT ATTIVATO ===");
 
-// --- IL BUTTAFUORI (Gestione Coda Elaborazione) ---
 const processingQueue = [];
 let isProcessing = false;
-const activeStreams = new Map(); // Mappa per conservare i flussi audio proxy
 
 app.get('/', (req, res) => res.send('🏭 Magazzino Proxy Operativo'));
 
-// L'endpoint principale che riceve le richieste e le mette in coda
 app.get('/api/process', async (req, res) => {
     const query = req.query.q;
     const isPlaylist = req.query.isPlaylist === 'true';
 
-    console.log(`[📩 RICEVUTO] Aggiunto alla coda di elaborazione: "${query}"`);
+    console.log(`[📩 RICEVUTO] Aggiunto alla coda: "${query}"`);
     
-    // Creiamo una Promise che verrà risolta quando la canzone sarà pronta
     const taskPromise = new Promise((resolve, reject) => {
         processingQueue.push({ query, isPlaylist, resolve, reject });
     });
@@ -36,7 +35,6 @@ app.get('/api/process', async (req, res) => {
     }
 });
 
-// Il motore che elabora UNA canzone alla volta
 async function processNextInQueue() {
     if (processingQueue.length === 0) {
         isProcessing = false;
@@ -49,15 +47,9 @@ async function processNextInQueue() {
     const apiKey = process.env.RAPIDAPI_KEY;
 
     try {
-        console.log(`\n[⚙️ ELABORO] Inizio task per: "${task.query}"`);
+        console.log(`\n[⚙️ ELABORO] Task: "${task.query}"`);
 
-        // STEP 1: RICERCA SU YOUTUBE (O RISOLUZIONE SPOTIFY)
         let searchQuery = task.query;
-        if (task.isPlaylist) {
-           // Se Sergio ci dice che è un elemento playlist, non è un link ma un titolo puro
-           searchQuery = task.query;
-        }
-
         console.log(`[🔎 STEP 1] Cerco su YouTube: ${searchQuery}`);
         const searchResult = await ytSearch(searchQuery);
         const video = searchResult.videos[0];
@@ -65,7 +57,6 @@ async function processNextInQueue() {
         if (!video) throw new Error("Video non trovato.");
         console.log(`[🎯 STEP 1 OK] Trovato: "${video.title}"`);
 
-        // STEP 2: CONVERSIONE RAPIDAPI
         const host = "youtube-mp4-mp3-downloader.p.rapidapi.com";
         const headers = { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': host };
         
@@ -78,9 +69,10 @@ async function processNextInQueue() {
         
         if (!directUrl) {
             const ticket = startData.progressId;
-            console.log(`[🎫 STEP 2] Ticket: ${ticket}. Polling...`);
+            console.log(`[🎫 STEP 2] Ticket: ${ticket}. Polling aumentato a 4 min...`);
 
-            for (let i = 0; i < 25; i++) {
+            // AUMENTATO A 50 TENTATIVI (Circa 3.5 minuti) per non fallire mai
+            for (let i = 0; i < 50; i++) {
                 await new Promise(r => setTimeout(r, 4000));
                 const progRes = await fetch(`https://${host}/api/v1/progress?id=${ticket}`, { headers });
                 if (progRes.ok) {
@@ -91,17 +83,30 @@ async function processNextInQueue() {
             }
         }
 
-        if (!directUrl) throw new Error("Timeout API conversione.");
+        if (!directUrl) throw new Error("Timeout estremo API conversione.");
+        console.log(`[✅ STEP 2 OK] Link ottenuto. Inizio download su disco...`);
 
-        console.log(`[✅ STEP 2 OK] Link RapidAPI ottenuto.`);
-
-        // STEP 3: CREAZIONE DEL PROXY (Il fix per il Lag UND_ERR_SOCKET)
-        // Invece di dare il link a Koyeb, salviamo il link. Koyeb chiamerà un nostro endpoint per avere lo stream stabile
+        // STEP 3: DOWNLOAD COMPLETO SU DISCO (Addio Lag)
         const streamId = Math.random().toString(36).substring(7);
-        activeStreams.set(streamId, directUrl);
+        const fileName = `${streamId}.mp3`;
+        const filePath = path.join(__dirname, fileName);
 
-        // Manteniamo pulita la RAM: il link proxy scade dopo 2 ore
-        setTimeout(() => activeStreams.delete(streamId), 2 * 60 * 60 * 1000);
+        const audioResponse = await fetch(directUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+        if (!audioResponse.ok) throw new Error("Il server origine ha rifiutato il download.");
+
+        // Salviamo l'intero MP3 fisicamente nel server Render
+        const webStream = Readable.fromWeb(audioResponse.body);
+        await pipeline(webStream, fs.createWriteStream(filePath));
+        
+        console.log(`[💾 STEP 3 OK] File MP3 salvato fisicamente: ${fileName}`);
+
+        // Eliminiamo il file dopo 2 ore per non riempire la memoria
+        setTimeout(() => {
+            if (fs.existsSync(filePath)) {
+                fs.unlinkSync(filePath);
+                console.log(`[🗑️ PULIZIA] File ${fileName} eliminato.`);
+            }
+        }, 2 * 60 * 60 * 1000);
 
         const proxyUrl = `https://${process.env.RENDER_EXTERNAL_HOSTNAME}/api/stream/${streamId}`;
 
@@ -109,49 +114,51 @@ async function processNextInQueue() {
             success: true, 
             title: video.title, 
             videoId: video.videoId, 
-            url: proxyUrl // Restituiamo il link del nostro proxy, non quello ballerino di RapidAPI
+            url: proxyUrl 
         });
 
     } catch (e) {
         console.error(`[❌ ERRORE TASK]`, e.message);
         task.reject(e);
     } finally {
-        processNextInQueue(); // Passa alla prossima richiesta
+        processNextInQueue(); 
     }
 }
 
-// L'endpoint PROXY che serve l'audio in modo stabile a Koyeb
-app.get('/api/stream/:id', async (req, res) => {
-    const directUrl = activeStreams.get(req.params.id);
-    if (!directUrl) return res.status(404).send("Stream scaduto o non trovato.");
-
-    try {
-        const audioResponse = await fetch(directUrl, {
-            headers: { 'User-Agent': 'Mozilla/5.0' }
-        });
-        
-        if (!audioResponse.ok) throw new Error("Errore fetch dal server origine.");
-
-        res.setHeader('Content-Type', 'audio/mpeg');
-        Readable.fromWeb(audioResponse.body).pipe(res);
-    } catch (e) {
-        console.error("[❌ ERRORE PROXY]", e.message);
-        res.status(500).send("Errore Stream");
+// L'endpoint che serve il file direttamente dal Disco Rigido
+app.get('/api/stream/:id', (req, res) => {
+    const filePath = path.join(__dirname, req.params.id + ".mp3");
+    if (!fs.existsSync(filePath)) {
+        return res.status(404).send("File scaduto o inesistente.");
     }
+    
+    // Serve il file MP3 statico ad altissima velocità
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.sendFile(filePath);
 });
 
-// L'endpoint per leggere SPOTIFY
+// Fixato il rilevamento nomi per Spotify
 app.get('/api/spotify', async (req, res) => {
     const url = req.query.url;
     try {
-        console.log(`[🟢 SPOTIFY] Leggo i metadati da: ${url}`);
+        console.log(`[🟢 SPOTIFY] Estraggo metadati avanzati...`);
         const data = await spotify.getTracks(url);
         if (!data || data.length === 0) throw new Error("Playlist vuota o privata.");
         
-        // Estraiamo "Artista - Titolo" per la ricerca successiva su YT
-        const trackNames = data.map(track => `${track.artists ? track.artists[0].name : ''} ${track.name}`.trim());
+        // Estrazione nome artista sicura al 100%
+        const trackNames = data.map(track => {
+            let artistStr = "";
+            if (track.artists && track.artists.length > 0) {
+                artistStr = track.artists.map(a => a.name).join(' ');
+            } else if (track.subtitle) {
+                artistStr = track.subtitle;
+            }
+            return `${artistStr} ${track.name}`.trim();
+        });
+        
         res.json({ success: true, tracks: trackNames });
     } catch (e) {
+        console.error(`[❌ ERRORE SPOTIFY]`, e.message);
         res.status(500).json({ error: "Impossibile leggere il link Spotify." });
     }
 });
