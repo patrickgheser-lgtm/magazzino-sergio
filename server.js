@@ -183,20 +183,30 @@ app.get('/api/stream/:id', (req, res) => {
     res.sendFile(filePath);
 });
 
-// Endpoint Spotify
+// Endpoint Spotify Aggiornato (Titoli perfetti)
 app.get('/api/spotify', async (req, res) => {
     const url = req.query.url;
     try {
+        console.log(`[🟢 SPOTIFY] Estraggo metadati avanzati...`);
         const data = await spotify.getTracks(url);
-        if (!data || data.length === 0) throw new Error("Playlist privata.");
+        if (!data || data.length === 0) throw new Error("Playlist vuota o privata.");
         
         const trackNames = data.map(track => {
-            let artistStr = track.artists && track.artists.length > 0 ? track.artists.map(a => a.name).join(' ') : (track.subtitle || "");
-            return `${artistStr} ${track.name}`.trim();
+            let artistStr = "Artista Sconosciuto";
+            if (track.artists && track.artists.length > 0) {
+                artistStr = track.artists[0].name;
+            } else if (track.subtitle) {
+                artistStr = track.subtitle.split(',')[0]; 
+            } else if (track.author) {
+                artistStr = track.author;
+            }
+            return `${artistStr} - ${track.name}`.trim();
         });
+        
         res.json({ success: true, tracks: trackNames });
     } catch (e) {
-        res.status(500).json({ error: "Errore Spotify." });
+        console.error(`[❌ ERRORE SPOTIFY]`, e.message);
+        res.status(500).json({ error: "Impossibile leggere il link Spotify." });
     }
 });
 
