@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "API di supporto per Sergio Acciaio",
   "main": "server.js",
+  "yt-search": "^2.10.4",
   "scripts": {
     "start": "node server.js"
   },
