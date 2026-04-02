@@ -1,7 +1,6 @@
 require('dotenv').config();
 const express = require('express');
 const ytSearch = require('yt-search');
-const spotify = require('spotify-url-info')(fetch);
 const { Readable } = require('stream');
 const { pipeline } = require('stream/promises');
 const fs = require('fs');
@@ -183,27 +182,69 @@ app.get('/api/stream/:id', (req, res) => {
     res.sendFile(filePath);
 });
 
-// Endpoint Spotify Aggiornato (Titoli perfetti)
+// ==========================================
+// ENDPOINT SPOTIFY NATIVO (Zero Dipendenze)
+// ==========================================
 app.get('/api/spotify', async (req, res) => {
     const url = req.query.url;
     try {
-        console.log(`[🟢 SPOTIFY] Estraggo metadati avanzati...`);
-        const data = await spotify.getTracks(url);
-        if (!data || data.length === 0) throw new Error("Playlist vuota o privata.");
+        console.log(`[🟢 SPOTIFY] Estraggo metadati tramite API Ufficiale (Token Anonimo)...`);
+
+        // 1. Identifichiamo ID e Tipo dall'URL
+        const regex = /(playlist|album|track)\/([a-zA-Z0-9]+)/;
+        const match = url.match(regex);
+        if (!match) throw new Error("Link Spotify non riconosciuto o formato non valido.");
         
-        const trackNames = data.map(track => {
-            let artistStr = "Artista Sconosciuto";
-            if (track.artists && track.artists.length > 0) {
-                artistStr = track.artists[0].name;
-            } else if (track.subtitle) {
-                artistStr = track.subtitle.split(',')[0]; 
-            } else if (track.author) {
-                artistStr = track.author;
-            }
-            return `${artistStr} - ${track.name}`.trim();
+        const type = match[1];
+        const id = match[2];
+
+        // 2. Otteniamo un Token di Accesso Anonimo direttamente dal web player di Spotify
+        const tokenRes = await fetch("https://open.spotify.com/get_access_token?reason=transport&productType=web_player", {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
         });
+        const tokenData = await tokenRes.json();
+        const token = tokenData.accessToken;
         
+        if (!token) throw new Error("Impossibile generare il token Spotify.");
+
+        // 3. Facciamo la chiamata ufficiale alle API usando il Token
+        const headers = { 'Authorization': `Bearer ${token}` };
+        let trackNames = [];
+
+        if (type === 'playlist') {
+            const apiRes = await fetch(`https://api.spotify.com/v1/playlists/${id}/tracks?limit=100`, { headers });
+            const data = await apiRes.json();
+            if (data.items) {
+                data.items.forEach(item => {
+                    if (item.track && item.track.name) {
+                        const artists = item.track.artists.map(a => a.name).join(", ");
+                        trackNames.push(`${artists} - ${item.track.name}`);
+                    }
+                });
+            }
+        } else if (type === 'album') {
+            const apiRes = await fetch(`https://api.spotify.com/v1/albums/${id}`, { headers });
+            const data = await apiRes.json();
+            const mainArtist = data.artists ? data.artists.map(a => a.name).join(", ") : "";
+            
+            if (data.tracks && data.tracks.items) {
+                data.tracks.items.forEach(track => {
+                    const artists = track.artists ? track.artists.map(a => a.name).join(", ") : mainArtist;
+                    trackNames.push(`${artists} - ${track.name}`);
+                });
+            }
+        } else if (type === 'track') {
+            const apiRes = await fetch(`https://api.spotify.com/v1/tracks/${id}`, { headers });
+            const data = await apiRes.json();
+            const artists = data.artists.map(a => a.name).join(", ");
+            trackNames.push(`${artists} - ${data.name}`);
+        }
+
+        if (trackNames.length === 0) throw new Error("Playlist/Album vuoto o privato.");
+
+        console.log(`[✅ SPOTIFY OK] Trovate ${trackNames.length} tracce reali!`);
         res.json({ success: true, tracks: trackNames });
+
     } catch (e) {
         console.error(`[❌ ERRORE SPOTIFY]`, e.message);
         res.status(500).json({ error: "Impossibile leggere il link Spotify." });
