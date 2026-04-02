@@ -202,7 +202,11 @@ app.get('/api/spotify', async (req, res) => {
         const tokenRes = await fetch("https://open.spotify.com/get_access_token?reason=transport&productType=web_player", {
             headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
         });
-        const tokenData = await tokenRes.json();
+        
+        const tokenText = await tokenRes.text();
+        if (tokenText.startsWith('<')) throw new Error("Spotify ha bloccato la richiesta (Ricevuto HTML invece di JSON).");
+        
+        const tokenData = JSON.parse(tokenText);
         const token = tokenData.accessToken;
         
         if (!token) throw new Error("Impossibile generare il token Spotify.");
